@@ -1,5 +1,6 @@
 package com.hxs.ecsdeploy;
 
+import com.hxs.ecsdeploy.commands.CommandHandler;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.boot.Banner;
@@ -13,6 +14,8 @@ import java.util.Arrays;
 @SpringBootApplication
 @RequiredArgsConstructor
 public class EcsDeployApplication implements CommandLineRunner {
+
+    private final CommandHandler commandHandler;
 
     public static void main(String[] args) {
         turnDebugOnIfNedded(args);
@@ -30,6 +33,6 @@ public class EcsDeployApplication implements CommandLineRunner {
 
     @Override
     public void run(String... args) throws Exception {
-
+        commandHandler.handleArgs(args);
     }
 }
