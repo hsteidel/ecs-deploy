@@ -40,6 +40,8 @@ dependencies {
 
     implementation 'commons-cli:commons-cli:1.5.0'
     implementation "software.amazon.awssdk:ecs"
+    implementation "software.amazon.awssdk:ssm"
+    implementation "software.amazon.awssdk:sso"
 
     testImplementation 'org.springframework.boot:spring-boot-starter-test'
 }

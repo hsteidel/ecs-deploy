@@ -1,25 +1,32 @@
 package com.hxs.ecsdeploy.commands;
 
 import com.hxs.ecsdeploy.ApplicationException;
-import com.hxs.ecsdeploy.aws.EcsClientFactory;
+import com.hxs.ecsdeploy.aws.EcsServiceFinder;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.stereotype.Service;
+import software.amazon.awssdk.services.ecs.EcsClient;
 import software.amazon.awssdk.services.ecs.model.*;
 import software.amazon.awssdk.services.ecs.waiters.EcsWaiter;
+import software.amazon.awssdk.services.ssm.SsmClient;
 
 
 @Slf4j
-@Service
 @RequiredArgsConstructor
 public class UpdateServiceCommand {
 
-    private final EcsClientFactory ecsClientFactory;
+    private final SsmClient ssm;
+
+    private final EcsClient ecs;
+
+    private final EcsServiceFinder ecsServiceFinder;
 
     public void run(UpdateServiceOptions updateOptions) {
         log.debug("Running update command...{}", updateOptions);
+        var serviceDescriptor = ecsServiceFinder.find(ssm, updateOptions.getCluster(), updateOptions.getService());
+        updateService(updateOptions.cloneWith(serviceDescriptor.clusterName(), serviceDescriptor.serviceName()));
+    }
 
-        var ecs = ecsClientFactory.ecsClient(updateOptions.getRegion());
+    private void updateService(UpdateServiceOptions updateOptions) {
         DescribeServicesResponse describeServicesResponse = ecs.describeServices(DescribeServicesRequest.builder()
                 .cluster(updateOptions.getCluster())
                 .services(updateOptions.getService())
@@ -28,46 +35,20 @@ public class UpdateServiceCommand {
         var service = describeServicesResponse.services().stream()
                 .findFirst()
                 .orElseThrow(() -> new ApplicationException("service not found!"));
-
         log.debug("Service {} found", service.serviceArn());
 
         var currentTaskDefinitionArn = service.taskDefinition();
         log.debug("Current task def: {}", currentTaskDefinitionArn);
 
-        TaskDefinition taskDefinition = ecs.describeTaskDefinition(
-                DescribeTaskDefinitionRequest.builder()
-                        .taskDefinition(currentTaskDefinitionArn)
-                        .build()).taskDefinition();
+        var clonedTaskedDefinition = cloneAndUpdateTaskDefinitionImage(currentTaskDefinitionArn, updateOptions.getTag());
+        var updatedServiceInfo = updateService(clonedTaskedDefinition, updateOptions);
 
-        ContainerDefinition existingContainerDefinition = taskDefinition.containerDefinitions().stream().findAny().orElseThrow();
-        var existingImage = existingContainerDefinition.image();
-        var newImage = existingImage.substring(0, existingImage.indexOf(":")) + ":" + updateOptions.getTag();
-        log.debug("New image definition: {}", newImage);
+        log.info("Waiting for service to update successfully....");
+        waitForServiceUpdateOrRollback(updateOptions, updatedServiceInfo, currentTaskDefinitionArn);
+    }
 
-        ContainerDefinition newContainerDefinition = existingContainerDefinition.toBuilder()
-                .copy()
-                .image(newImage)
-                .build();
-
-        TaskDefinition newTaskDefinition = ecs.registerTaskDefinition(
-                RegisterTaskDefinitionRequest.builder()
-                        .cpu(taskDefinition.cpu())
-                        .memory(taskDefinition.memory())
-                        .family(taskDefinition.family())
-                        .ipcMode(taskDefinition.ipcMode())
-                        .pidMode(taskDefinition.pidMode())
-                        .volumes(taskDefinition.volumes())
-                        .networkMode(taskDefinition.networkMode())
-                        .taskRoleArn(taskDefinition.taskRoleArn())
-                        .containerDefinitions(newContainerDefinition)
-                        .ephemeralStorage(taskDefinition.ephemeralStorage())
-                        .executionRoleArn(taskDefinition.executionRoleArn())
-                        .proxyConfiguration(taskDefinition.proxyConfiguration())
-                        .placementConstraints(taskDefinition.placementConstraints())
-                        .inferenceAccelerators(taskDefinition.inferenceAccelerators())
-                        .requiresCompatibilities(taskDefinition.requiresCompatibilities())
-                        .build()).taskDefinition();
-
+    private UpdatedServiceInfo updateService(RegisterTaskDefinitionRequest clonedTaskedDefinition, UpdateServiceOptions updateOptions) {
+        TaskDefinition newTaskDefinition = ecs.registerTaskDefinition(clonedTaskedDefinition).taskDefinition();
         log.debug("Registered new task def: {}", newTaskDefinition.taskDefinitionArn());
 
         var updatedService = ecs.updateService(
@@ -77,28 +58,88 @@ public class UpdateServiceCommand {
                         .taskDefinition(newTaskDefinition.taskDefinitionArn())
                         .build()
         ).service();
-        log.info("Updated service with new image tag!");
-
-        log.info("Waiting for service to update successfully....");
-        var waiter = EcsWaiter.builder().client(ecs).build();
-        var waiterResponse = waiter.waitUntilServicesStable(DescribeServicesRequest.builder()
-                        .services(updatedService.serviceArn())
-                        .cluster(updateOptions.getCluster())
-                .build());
-        waiterResponse.matched().response().ifPresent(r -> {
-            log.info("Service updated successfully!");
-        });
-
-        waiterResponse.matched().exception().ifPresent(t -> {
-            log.error("Failed to update service, rolling back: {}", t.getMessage());
-            var rolledBackService = ecs.updateService(
-                    UpdateServiceRequest.builder()
-                            .cluster(updateOptions.getCluster())
-                            .service(updateOptions.getService())
-                            .taskDefinition(currentTaskDefinitionArn)
-                            .build()
-            ).service();
-            log.info("Rolled back to task def: {}", rolledBackService.taskDefinition());
-        });
+        log.info("Updated service with new image tag! {}", updateOptions.getTag());
+        return new UpdatedServiceInfo(updatedService.serviceArn(), newTaskDefinition.taskDefinitionArn());
     }
+
+    record UpdatedServiceInfo(
+            String newServiceArn,
+            String newTaskDefinitionArn
+    ) {
+
+    }
+
+    private void waitForServiceUpdateOrRollback(UpdateServiceOptions updateOptions, UpdatedServiceInfo updatedServiceInfo, String currentTaskDefinitionArn) {
+        var waiter = EcsWaiter.builder().client(ecs).build();
+        try {
+            var waiterResponse = waiter.waitUntilServicesStable(DescribeServicesRequest.builder()
+                    .services(updatedServiceInfo.newServiceArn)
+                    .cluster(updateOptions.getCluster())
+                    .build());
+            waiterResponse.matched().response().ifPresent(r ->
+                    log.info("Service updated successfully!")
+            );
+            waiterResponse.matched().exception().ifPresent(t -> {
+                log.error("Failed to update service, rolling back: {}", t.getMessage());
+                rollback(ecs, updateOptions, currentTaskDefinitionArn, updatedServiceInfo.newTaskDefinitionArn);
+            });
+        } catch (Exception e) {
+            log.error("Failed to update service, rolling back: {}", e.getMessage());
+            rollback(ecs, updateOptions, currentTaskDefinitionArn, updatedServiceInfo.newTaskDefinitionArn);
+        }
+
+    }
+
+    private void rollback(EcsClient ecs, UpdateServiceOptions updateOptions, String currentTaskDefinitionArn, String clonedTaskedDefinitionArn) {
+        var rolledBackService = ecs.updateService(
+                UpdateServiceRequest.builder()
+                        .cluster(updateOptions.getCluster())
+                        .service(updateOptions.getService())
+                        .taskDefinition(currentTaskDefinitionArn)
+                        .build()
+        ).service();
+        ecs.deregisterTaskDefinition(
+                DeregisterTaskDefinitionRequest.builder()
+                        .taskDefinition(clonedTaskedDefinitionArn)
+                        .build()
+        );
+        log.info("Rolled back to task def: {}", rolledBackService.taskDefinition());
+    }
+
+    private RegisterTaskDefinitionRequest cloneAndUpdateTaskDefinitionImage(String currentTaskDefinitionArn, String newImageTag) {
+        TaskDefinition taskDefinition = ecs.describeTaskDefinition(
+                DescribeTaskDefinitionRequest.builder()
+                        .taskDefinition(currentTaskDefinitionArn)
+                        .build()).taskDefinition();
+
+        ContainerDefinition existingContainerDefinition = taskDefinition.containerDefinitions().stream().findAny().orElseThrow();
+        var existingImage = existingContainerDefinition.image();
+        var newImage = existingImage.substring(0, existingImage.indexOf(":")) + ":" + newImageTag;
+        log.debug("New image definition: {}", newImage);
+
+        ContainerDefinition newContainerDefinition = existingContainerDefinition.toBuilder()
+                .copy()
+                .image(newImage)
+                .build();
+
+        return RegisterTaskDefinitionRequest.builder()
+                .cpu(taskDefinition.cpu())
+                .memory(taskDefinition.memory())
+                .family(taskDefinition.family())
+                .ipcMode(taskDefinition.ipcMode())
+                .pidMode(taskDefinition.pidMode())
+                .volumes(taskDefinition.volumes())
+                .networkMode(taskDefinition.networkMode())
+                .taskRoleArn(taskDefinition.taskRoleArn())
+                .containerDefinitions(newContainerDefinition)
+                .runtimePlatform(taskDefinition.runtimePlatform())
+                .ephemeralStorage(taskDefinition.ephemeralStorage())
+                .executionRoleArn(taskDefinition.executionRoleArn())
+                .proxyConfiguration(taskDefinition.proxyConfiguration())
+                .placementConstraints(taskDefinition.placementConstraints())
+                .inferenceAccelerators(taskDefinition.inferenceAccelerators())
+                .requiresCompatibilities(taskDefinition.requiresCompatibilities())
+                .build();
+    }
+
 }

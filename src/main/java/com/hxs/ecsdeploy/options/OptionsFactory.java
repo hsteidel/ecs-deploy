@@ -16,7 +16,7 @@ public class OptionsFactory {
                         .longOpt("cluster")
                         .required()
                         .hasArg()
-                        .desc("target cluster arn or name")
+                        .desc("target cluster arn or name or SSM param name containing the value")
                         .build()
         );
 
@@ -25,7 +25,7 @@ public class OptionsFactory {
                         .longOpt("service")
                         .required()
                         .hasArg()
-                        .desc("target service arn or name")
+                        .desc("target service arn or name or SSM param name containing the value")
                         .build()
         );
 

@@ -2,13 +2,13 @@ package com.hxs.ecsdeploy.aws;
 
 import org.springframework.stereotype.Component;
 import software.amazon.awssdk.regions.Region;
-import software.amazon.awssdk.services.ecs.EcsClient;
+import software.amazon.awssdk.services.ssm.SsmClient;
 
 @Component
-public class EcsClientFactory {
+public class SsmParamClientFactory {
 
-    public EcsClient withRegion(String region) {
-        return EcsClient.builder()
+    public SsmClient withRegion(String region) {
+        return SsmClient.builder()
                 .region(Region.of(region))
                 .build();
     }
